@@ -1,6 +1,8 @@
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 import chromadb
+import os
+from dotenv import load_dotenv
 
 # --------------------------
 # Read PDF
@@ -75,9 +77,12 @@ print("\nRetrieved Context:")
 # Send to GPT
 # --------------------------
 
+# Load environment variables from .env file
+load_dotenv()
+
 from openai import OpenAI
 
-client = OpenAI(api_key="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")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 response = client.responses.create(
     model="gpt-4.1-mini",

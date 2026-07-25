@@ -1,0 +1,39 @@
+# Environment variables
+.env
+.env*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ChromaDB / Vector DB caches
+chroma/
+chroma_db/
+*.chroma
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+build/
+dist/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# IDE & System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
