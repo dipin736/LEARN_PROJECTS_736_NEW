@@ -1,33 +1,32 @@
 import os
+import re
+import ast
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
-import chromadb
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
 
-# --------------------------
-# Initialization
-# --------------------------
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable Cross-Origin Resource Sharing for Next.js frontend
+CORS(app)
 
-# Initialize OpenAI client safely
 def is_valid_key(key):
     return key and not key.startswith("your_openai_api_key") and key != "sk-placeholder"
 
 api_key = os.getenv("OPENAI_API_KEY")
 if not is_valid_key(api_key):
-    print("⚠️ WARNING: Real OPENAI_API_KEY not set in .env. Running in Local RAG Context Mode.")
+    print("⚠️ WARNING: Real OPENAI_API_KEY not set in .env. Running in Local Analyzer Mode.")
     openai_client = None
 else:
-    openai_client = OpenAI(api_key=api_key)
+    try:
+        openai_client = OpenAI(api_key=api_key)
+    except Exception as e:
+        print(f"⚠️ Error initializing OpenAI client: {e}")
+        openai_client = None
 
 def get_openai_client():
-    """Retrieve or dynamically initialize the OpenAI client."""
     global openai_client
     key = os.getenv("OPENAI_API_KEY")
     if is_valid_key(key):
@@ -37,108 +36,209 @@ def get_openai_client():
             return None
     return None
 
-# Load the embedding model once
-print("Loading embedding model...")
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-print("Model loaded.")
+def analyze_code_locally(code: str, language: str = "python", focus: str = "all"):
+    """
+    Local static analysis engine when OpenAI API key is unavailable.
+    Inspects syntax, security patterns, performance bottlenecks, and code style.
+    """
+    lines = code.split("\n")
+    issues = []
+    score_deductions = 0
 
-# Setup ChromaDB client
-chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection("hospital_handbook")
+    # 1. Security Analysis
+    sec_patterns = [
+        (r'\beval\s*\(', 'critical', 'Security Vulnerability: `eval()` detected', 'Avoid using `eval()` as it allows arbitrary code execution. Use safer alternatives like `ast.literal_eval()` or direct parsing.'),
+        (r'\bexec\s*\(', 'critical', 'Security Vulnerability: `exec()` detected', 'Avoid `exec()` as it introduces severe code injection risks.'),
+        (r'\bos\.system\s*\(', 'warning', 'Security Warning: Shell execution via `os.system()`', 'Prefer `subprocess.run(..., shell=False)` with argument arrays to prevent command injection.'),
+        (r'(password|secret|api_key|token)\s*=\s*["\'][^"\']+["\']', 'warning', 'Security Risk: Hardcoded credential or API key', 'Store sensitive keys in `.env` environment variables using `os.getenv()`.'),
+        (r'SELECT\s+.*\s+FROM\s+.*\+\s*\w+', 'critical', 'Security Vulnerability: Potential SQL Injection', 'Use parameterized queries / ORM placeholders instead of string concatenation in SQL queries.')
+    ]
 
-# --------------------------
-# Data Loading and Indexing (run once at startup)
-# --------------------------
-def setup_vector_db():
-    """Reads a PDF, chunks the text, and stores embeddings in ChromaDB."""
-    if collection.count() > 0:
-        print("Vector database already contains data. Skipping setup.")
-        return
+    for idx, line in enumerate(lines, 1):
+        for pattern, severity, title, desc in sec_patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                issues.append({
+                    "line": idx,
+                    "type": severity,
+                    "title": title,
+                    "description": desc,
+                    "suggested_fix": f"# Line {idx}: Refactored for security\n" + line.replace("eval(", "ast.literal_eval(").replace("exec(", "# REMOVED EXEC: ")
+                })
+                score_deductions += 15 if severity == 'critical' else 8
 
-    print("Reading PDF and setting up vector database...")
-    reader = PdfReader("company_handbook_rag_sample.pdf")
-    text = "".join(page.extract_text() for page in reader.pages)
-    chunks = [c.strip() for c in text.split("\n") if c.strip()]
+    # 2. Python AST & Syntax Inspection
+    if language.lower() == "python":
+        try:
+            parsed = ast.parse(code)
+            
+            # Check for docstrings in functions
+            for node in ast.walk(parsed):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not ast.get_docstring(node):
+                        issues.append({
+                            "line": node.lineno,
+                            "type": "info",
+                            "title": f"Missing Docstring in `{node.name}()`",
+                            "description": f"Function `{node.name}` lacks a docstring explanation.",
+                            "suggested_fix": f'def {node.name}(...):\n    """Summary of {node.name} function."""'
+                        })
+                        score_deductions += 3
 
-    embeddings = embedding_model.encode(chunks).tolist()
-    collection.add(
-        documents=chunks,
-        embeddings=embeddings,
-        ids=[str(i) for i in range(len(chunks))]
-    )
-    print("Vector database setup complete.")
+                elif isinstance(node, ast.ExceptHandler):
+                    if node.type is None:
+                        issues.append({
+                            "line": node.lineno,
+                            "type": "warning",
+                            "title": "Bare `except:` clause",
+                            "description": "Catching all exceptions with a bare `except:` can hide unexpected errors. Specify explicit exception types (e.g. `except Exception as e:`).",
+                            "suggested_fix": "except Exception as e:\n    logger.error(f'Error occurred: {e}')"
+                        })
+                        score_deductions += 7
+        except SyntaxError as syn_err:
+            issues.append({
+                "line": syn_err.lineno or 1,
+                "type": "critical",
+                "title": f"Syntax Error: {syn_err.msg}",
+                "description": f"Invalid syntax on line {syn_err.lineno}: '{syn_err.text.strip() if syn_err.text else ''}'",
+                "suggested_fix": f"# Fix syntax error at line {syn_err.lineno}"
+            })
+            score_deductions += 30
 
-setup_vector_db()
+    # 3. Performance & Clean Code Patterns
+    for idx, line in enumerate(lines, 1):
+        if "print(" in line and language.lower() == "python":
+            issues.append({
+                "line": idx,
+                "type": "info",
+                "title": "Production Code Practice: Raw `print()` statement",
+                "description": "Consider using Python's standard `logging` module instead of raw `print()` for production applications.",
+                "suggested_fix": line.replace("print(", "logger.info(")
+            })
+            score_deductions += 2
 
-# --------------------------
-# Flask API Routes
-# --------------------------
+        if len(line) > 100:
+            issues.append({
+                "line": idx,
+                "type": "info",
+                "title": "Code Style: Line length exceeds 100 characters",
+                "description": "Line length is long. Consider splitting across multiple lines for better readability (PEP 8 standard).",
+                "suggested_fix": line[:80] + " \\\n    " + line[80:]
+            })
+            score_deductions += 1
+
+    # Calculate overall quality score
+    quality_score = max(20, 100 - score_deductions)
+
+    # Generate Refactored Code Sample
+    refactored_code = code
+    for issue in issues:
+        if issue["type"] == "critical" and "eval" in issue["title"]:
+            refactored_code = refactored_code.replace("eval(", "ast.literal_eval(")
+        if "print(" in issue["title"]:
+            refactored_code = refactored_code.replace("print(", "# logger.info(")
+
+    key_takeaways = [
+        f"Overall code quality score is {quality_score}/100.",
+        f"Found {len(issues)} potential area(s) for improvement.",
+        "Ensure all environment variables and secrets are loaded securely from .env files.",
+        "Add explicit type hints and unit tests to ensure long-term code maintainability."
+    ]
+
+    return {
+        "score": quality_score,
+        "summary": f"Local Code Review completed for {language.capitalize()}. Identified {len(issues)} issue(s) across security, performance, and code quality.",
+        "issues": issues,
+        "refactored_code": refactored_code,
+        "key_takeaways": key_takeaways,
+        "mode": "local_analyzer"
+    }
+
 @app.route('/')
 def index():
-    """API info endpoint."""
     return jsonify({
         "status": "online",
-        "service": "Hospital Helper RAG API (Python Flask)",
-        "endpoints": ["/api/health", "/api/ask"]
+        "service": "AI Code Reviewer Backend API (Flask)",
+        "endpoints": ["/api/health", "/api/review"]
     })
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    """Health check endpoint for frontend."""
+    client = get_openai_client()
     return jsonify({
         "status": "healthy",
-        "documents_indexed": collection.count()
+        "service": "AI Code Reviewer API",
+        "openai_available": client is not None,
+        "mode": "AI (OpenAI)" if client else "Local Analyzer (Offline)"
     })
 
-@app.route('/ask', methods=['POST'])
-@app.route('/api/ask', methods=['POST'])
-def ask():
-    """Handle a user's question with semantic search and optional LLM synthesis."""
+@app.route('/api/review', methods=['POST'])
+def review_code():
     data = request.get_json(silent=True) or {}
-    question = data.get('question')
-    if not question:
-        return jsonify({"error": "No question provided"}), 400
+    code = data.get('code', '').strip()
+    language = data.get('language', 'python').strip()
+    focus = data.get('focus', 'all').strip()
 
-    try:
-        # 1. Semantic Search via SentenceTransformer & ChromaDB
-        query_embedding = embedding_model.encode(question).tolist()
-        results = collection.query(query_embeddings=[query_embedding], n_results=1)
-        
-        context = ""
-        if results and "documents" in results and results["documents"] and results["documents"][0]:
-            context = results["documents"][0][0]
+    if not code:
+        return jsonify({"error": "No code provided for review"}), 400
 
-        # 2. Try OpenAI completion if key is provided
-        client = get_openai_client()
-        if client:
-            try:
-                prompt = f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer only from the context provided. Be helpful and professional."
-                response = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                answer = response.choices[0].message.content
-                return jsonify({
-                    "answer": answer,
-                    "context": context
-                })
-            except Exception as llm_err:
-                print(f"OpenAI API call failed: {llm_err}. Falling back to retrieved RAG context.")
+    client = get_openai_client()
 
-        # Fallback / Local RAG mode (when no OpenAI key or invalid key)
-        fallback_answer = f"📄 [RAG Answer from Handbook]:\n\n{context}\n\n💡 (Note: Add a valid OpenAI API key in .env to enable GPT-3.5 response synthesis)."
-        return jsonify({
-            "answer": fallback_answer,
-            "context": context
-        })
+    if client:
+        try:
+            system_prompt = """You are an expert Senior Software Engineer and Security Auditor.
+Review the provided code snippet and return your analysis strictly as a valid JSON object matching this schema:
+{
+  "score": <number between 0 and 100>,
+  "summary": "<2-3 sentence overview of code quality and main findings>",
+  "issues": [
+    {
+      "line": <line_number or 1>,
+      "type": "<critical|warning|info|security>",
+      "title": "<short issue title>",
+      "description": "<detailed explanation of the flaw or vulnerability>",
+      "suggested_fix": "<corrected code snippet for this line/block>"
+    }
+  ],
+  "refactored_code": "<the complete, clean, optimized, and refactored version of the code>",
+  "key_takeaways": [
+    "<actionable takeaway 1>",
+    "<actionable takeaway 2>",
+    "<actionable takeaway 3>"
+  ]
+}
+Be constructive, accurate, and focus on security, performance, readability, and best practices. Do not wrap JSON in markdown formatting."""
 
-    except Exception as e:
-        print(f"Error processing query: {e}")
-        return jsonify({
-            "error": "Failed to process question.",
-            "details": str(e)
-        }), 500
+            user_prompt = f"Language: {language}\nFocus Area: {focus}\n\nCode to review:\n```\n{code}\n```"
+
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.2
+            )
+
+            raw_content = response.choices[0].message.content.strip()
+            # Clean markdown code fence if returned
+            if raw_content.startswith("```json"):
+                raw_content = raw_content[7:]
+            if raw_content.startswith("```"):
+                raw_content = raw_content[3:]
+            if raw_content.endswith("```"):
+                raw_content = raw_content[:-3]
+
+            parsed_json = json.loads(raw_content.strip())
+            parsed_json["mode"] = "openai_gpt"
+            return jsonify(parsed_json)
+
+        except Exception as err:
+            print(f"OpenAI API call failed: {err}. Falling back to Local Analyzer.")
+
+    # Local Analyzer Fallback
+    local_result = analyze_code_locally(code, language, focus)
+    return jsonify(local_result)
 
 if __name__ == '__main__':
+    print("🚀 Starting AI Code Reviewer Flask API on http://127.0.0.1:5001")
     app.run(debug=True, port=5001)
-
